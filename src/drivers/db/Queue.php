@@ -15,6 +15,7 @@ use yii\di\Instance;
 use yii\mutex\Mutex;
 use yii\queue\cli\Queue as CliQueue;
 use yii\queue\cli\Signal;
+use yii\queue\ConfirmJobInterface;
 
 /**
  * Db Queue
@@ -68,6 +69,10 @@ class Queue extends CliQueue
      */
     public function run()
     {
+
+        //deletes own expired rule messages
+        $this->checkCustomRules();
+
         while (!Signal::isExit() && ($payload = $this->reserve())) {
             if ($this->handleMessage(
                 $payload['id'],
@@ -140,7 +145,7 @@ class Queue extends CliQueue
      */
     public function remove($id)
     {
-        return (bool) $this->db->createCommand()
+        return (bool)$this->db->createCommand()
             ->delete($this->tableName, ['channel' => $this->channel, 'id' => $id])
             ->execute();
     }
@@ -162,6 +167,40 @@ class Queue extends CliQueue
         $id = $this->db->getLastInsertID($tableSchema->sequenceName);
 
         return $id;
+    }
+
+
+    protected function checkCustomRules()
+    {
+        return $this->db->useMaster(function () {
+            if (!$this->mutex->acquire(__CLASS__ . $this->channel, $this->mutexTimeout)) {
+                throw new Exception("Has not waited the lock.");
+            }
+
+            // Reserve one message
+            $payloads = (new Query())
+                ->from($this->tableName)
+                ->andWhere(['channel' => $this->channel, 'reserved_at' => null])
+                ->andWhere('[[pushed_at]] <= :time - delay', [':time' => time()])
+                ->orderBy(['priority' => SORT_ASC, 'id' => SORT_ASC])
+                ->all($this->db);
+
+
+            foreach ($payloads as $payload) {
+
+                if (is_array($payload)) {
+                    $class = $this->serializer->unserialize($payload['job']);
+                    if ($class instanceof ConfirmJobInterface) {
+                        if ($class->removeBeforeExecution()) {
+                            $this->db->createCommand()->delete($this->tableName, 'id = :id', [':id' => $payload['id']])->execute();
+                        }
+                    }
+                }
+            }
+
+
+            $this->mutex->release(__CLASS__ . $this->channel);
+        });
     }
 
     /**
@@ -189,6 +228,14 @@ class Queue extends CliQueue
                 ->limit(1)
                 ->one($this->db);
             if (is_array($payload)) {
+
+                $class = $this->serializer->unserialize($payload['job']);
+                if ($class instanceof ConfirmJobInterface) {
+                    if (!$class->shouldProcessExecution()) {
+                        return false;
+                    }
+                }
+
                 $payload['reserved_at'] = time();
                 $payload['attempt'] = (int)$payload['attempt'] + 1;
                 $this->db->createCommand()->update($this->tableName, [
@@ -207,7 +254,6 @@ class Queue extends CliQueue
             return $payload;
         });
     }
-
 
 
     /**
