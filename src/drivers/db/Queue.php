@@ -74,6 +74,9 @@ class Queue extends CliQueue
         $this->checkCustomRules();
 
         while (!Signal::isExit() && ($payload = $this->reserve())) {
+            if ($payload == 'skip') {
+                continue;
+            }
             if ($this->handleMessage(
                 $payload['id'],
                 $payload['job'],
@@ -232,7 +235,11 @@ class Queue extends CliQueue
                 $class = $this->serializer->unserialize($payload['job']);
                 if ($class instanceof ConfirmJobInterface) {
                     if (!$class->shouldProcessExecution()) {
-                        return false;
+                        \Yii::$app->db->createCommand(sprintf("
+                        UPDATE %s SET `delay` = `delay`+120
+                        WHERE id = %s                        
+                        ", $this->tableName, $payload['id']))->execute();
+                        return 'skip';
                     }
                 }
 
